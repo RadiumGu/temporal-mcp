@@ -1,5 +1,4 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -161,7 +160,21 @@ function parseArgs<T>(schema: z.ZodType<T>, args: unknown): { ok: true; data: T 
 
 // ─── Server ───────────────────────────────────────────────────────────────────
 
-async function main(): Promise<void> {
+/**
+ * 构造一个已注册好工具表与分发逻辑的 MCP Server，**不绑定任何传输**。
+ *
+ * 2026-09-24 从 `main()` 里抽出来的。动机：AgentCore Runtime 要求 HTTP 传输
+ * （`POST /mcp`，端口 8000），而这里原本只有 stdio。两个传输必须共用同一份
+ * 工具表和同一个 36 分支的分发 switch —— 在别处复制一份，两边迟早漂移，
+ * 而漂移的表现是「某个工具在一个传输上能用、在另一个上报 Unknown tool」。
+ *
+ * 返回 tier 与 toolCount 只为了让调用方打启动日志，没有别的用途。
+ */
+export function createConfiguredServer(): {
+  server: Server;
+  tier: string;
+  toolCount: number;
+} {
   // Validate configuration at startup — fail fast before connecting to MCP
   const client = createClientFromEnv();
 
@@ -169,6 +182,7 @@ async function main(): Promise<void> {
     { name: 'temporal-mcp', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
+
 
   const tier = resolveToolTier();
   const allToolDefs = [
@@ -414,13 +428,22 @@ async function main(): Promise<void> {
     }
   });
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-
-  process.stderr.write(`Temporal MCP server started (tools: ${tier}, ${tools.length} loaded)\n`);
+  return { server, tier, toolCount: tools.length };
 }
 
-main().catch((err) => {
-  process.stderr.write(`Fatal error: ${err instanceof Error ? err.message : String(err)}\n`);
-  process.exit(1);
-});
+// ⚠️ 本模块**刻意没有顶层副作用** —— 它是库，不是入口。
+//
+// 2026-09-24 的教训：原来这里是裸的 `main().catch(...)`，一被 import 就启动
+// stdio。我第一版的修法是加一道「只有直接运行才启动」的守卫
+// （realpath 比对 import.meta.url 与 process.argv[1]）。
+//
+// **那道守卫在打包后失效**：tsup 把本模块内联进 `agentcore-http.js`，
+// 于是内联代码里的 `import.meta.url` 指向的正是 argv[1]，守卫判定为真，
+// stdio 照样启动 —— 实测启动日志里同时出现了两行：
+//
+//     Temporal MCP server started (tools: all, 36 loaded)      ← 不该有
+//     temporal-mcp AgentCore transport on 0.0.0.0:18000/mcp
+//
+// 真正的修法不是让守卫更聪明，而是**库模块不要有顶层副作用**。
+// stdio 的启动搬到 `src/stdio.ts`，HTTP 的在 `src/agentcore-http.ts`，
+// 两个入口各自调用上面的 `createConfiguredServer()`。
