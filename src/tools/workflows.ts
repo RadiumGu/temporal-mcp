@@ -134,6 +134,47 @@ export const workflowToolDefinitions = [
         input: {
           description: 'Workflow input payload. Will be JSON-encoded.',
         },
+        execution_timeout: {
+          type: 'string',
+          description:
+            'Cap on the whole workflow including retries, e.g. "3600s". STRONGLY recommended for any workflow that mutates infrastructure — without it a stuck run hangs forever.',
+        },
+        run_timeout: {
+          type: 'string',
+          description: 'Cap on a single run, e.g. "1800s".',
+        },
+        task_timeout: {
+          type: 'string',
+          description: 'Cap on one workflow task, e.g. "30s".',
+        },
+        identity: {
+          type: 'string',
+          description: 'Who initiated this. Needed to attribute the action afterwards.',
+        },
+        request_id: {
+          type: 'string',
+          description:
+            'Idempotency key (UUID). Re-sending the same request_id will NOT start a second execution — pass it whenever the caller might retry.',
+        },
+        memo: {
+          type: 'object',
+          description:
+            'Non-indexed metadata attached to the execution (plan id, version, approver). Values are JSON-encoded automatically.',
+        },
+        search_attributes: {
+          type: 'object',
+          description:
+            'Indexed, searchable attributes. Keys must already be registered on the server (e.g. CustomKeywordField). Values are JSON-encoded automatically.',
+        },
+        retry_policy: {
+          type: 'object',
+          description: 'e.g. { "initialInterval": "5s", "maximumAttempts": 3 }.',
+        },
+        id_reuse_policy: {
+          type: 'string',
+          description:
+            'Must use the prefixed enum name, e.g. WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE. A bare value like ALLOW_DUPLICATE is rejected by the server.',
+        },
       },
       required: ['workflow_id', 'workflow_type', 'task_queue'],
     },
@@ -255,6 +296,51 @@ export const startWorkflowSchema = z.object({
   workflow_type: z.string(),
   task_queue: z.string(),
   input: z.unknown().optional(),
+
+  // ── 以下字段 2026-09-24 补 ────────────────────────────────────────────
+  //
+  // 原来只发 workflowType / taskQueue / input 三个。对「启动一个会改动
+  // 生产基础设施的灾备切换」来说，缺的这些都不是可选项：
+  //
+  //   没有超时       → 切换卡住时没有任何自动收尾，永远挂着
+  //   没有 identity  → 事后查不出是谁发起的切换
+  //   没有 requestId → 重试会起出第二个切换流程
+  //   没有 memo      → 计划正文/版本无处附着
+  //   没有 searchAttributes → 事后按「哪次演练」检索不到
+  //
+  // 每个字段的线上形式都对活服务端（1.29.7）实测过，不是照文档抄的。
+
+  /** 整个 workflow（含重试）的上限，如 "3600s"。实测字段名 workflowExecutionTimeout。 */
+  execution_timeout: z.string().optional(),
+  /** 单次 run 的上限，如 "1800s"。实测字段名 workflowRunTimeout。 */
+  run_timeout: z.string().optional(),
+  /** 单个 workflow task 的上限，如 "30s"。实测字段名 workflowTaskTimeout。 */
+  task_timeout: z.string().optional(),
+  /** 谁发起的。DR 事后复盘要靠它。 */
+  identity: z.string().optional(),
+  /**
+   * 幂等键。同一个 requestId 重复发不会起出第二个执行 ——
+   * 对「切换命令重试」这件事是必需的。
+   */
+  request_id: z.string().optional(),
+  /**
+   * 附带的非索引元数据（计划 ID、版本、批准人）。
+   * 实测形状：{fields:{<key>:{metadata,data}}}，describe 回读时是解码后的值。
+   */
+  memo: z.record(z.unknown()).optional(),
+  /**
+   * 可检索属性。键必须是服务端已注册的自定义属性名
+   * （实测 CustomKeywordField 可用，服务端回读时会补上 type: Keyword）。
+   */
+  search_attributes: z.record(z.unknown()).optional(),
+  /** 重试策略，如 { initialInterval: "5s", maximumAttempts: 3 }。 */
+  retry_policy: z.record(z.unknown()).optional(),
+  /**
+   * 同 workflow_id 的重用策略。
+   * ⚠️ 线上要带前缀，如 WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE ——
+   * 裸值会被服务端拒绝（与 taskQueueType 同一个坑）。
+   */
+  id_reuse_policy: z.string().optional(),
 });
 
 export const signalWorkflowSchema = z.object({
@@ -473,6 +559,40 @@ export async function handleStartWorkflow(
     body.input = { payloads: [encodePayload(args.input)] };
   }
 
+  // ── 下面这些字段的线上名都是对活服务端实测确认的 ──────────────────────
+  //
+  // 服务端对未知字段是**硬拒绝**而不是静默丢弃，实测：
+  //   {"code":3,"message":"temporalproto: (line 1:55): unknown field
+  //    \"totallyBogusField\""}
+  // 所以名字写错会响亮地失败 —— 这比静默丢弃安全得多，但也意味着
+  // 这里每一个名字都必须是对的。
+
+  if (args.execution_timeout) body.workflowExecutionTimeout = args.execution_timeout;
+  if (args.run_timeout) body.workflowRunTimeout = args.run_timeout;
+  if (args.task_timeout) body.workflowTaskTimeout = args.task_timeout;
+  if (args.identity) body.identity = args.identity;
+  if (args.request_id) body.requestId = args.request_id;
+  if (args.id_reuse_policy) body.workflowIdReusePolicy = args.id_reuse_policy;
+  if (args.retry_policy) body.retryPolicy = args.retry_policy;
+
+  // memo / searchAttributes 的值都要包成 payload，不能直接放原值。
+  // 实测回读：memo 是解码后的值，searchAttributes 是原 payload 外加
+  // 服务端补的 type 字段。
+  if (args.memo) {
+    body.memo = {
+      fields: Object.fromEntries(
+        Object.entries(args.memo).map(([k, v]) => [k, encodePayload(v)])
+      ),
+    };
+  }
+  if (args.search_attributes) {
+    body.searchAttributes = {
+      indexedFields: Object.fromEntries(
+        Object.entries(args.search_attributes).map(([k, v]) => [k, encodePayload(v)])
+      ),
+    };
+  }
+
   const data = await client.post<Record<string, unknown>>(
     `/api/v1/namespaces/${encodeURIComponent(ns)}/workflows/${encodeURIComponent(args.workflow_id)}`,
     body
@@ -484,6 +604,21 @@ export async function handleStartWorkflow(
     `- Run ID: ${data.runId ?? 'N/A'}`,
     `- Started: ${data.started !== undefined ? data.started : 'yes'}`,
   ];
+
+  // ⚠️ 启动成功 ≠ 切换正在进行。
+  //
+  // 实测（1.29.7）：在**没有任何 worker** 的任务队列上起 workflow 也会
+  // 返回 started:true / status:RUNNING。那个执行会一直挂着等一个不存在
+  // 的 worker，直到保留期到点被清掉。
+  //
+  // 对灾备切换来说，把 started:true 当作「切换已启动」是危险的误读，
+  // 所以这里主动提醒下一步必须独立确认有 worker 接单。
+  lines.push(
+    '',
+    '> ⚠️ `started: true` 只表示服务端受理了这次启动，**不表示有 worker 在执行**。',
+    '> 实测：无 worker 的队列同样返回 `started: true` / `RUNNING`，执行会一直挂着。',
+    `> 请用 \`describe_task_queue\` 查 \`${args.task_queue}\` 是否真的返回了 pollers 字段。`
+  );
 
   return { content: [{ type: 'text', text: lines.join('\n') }] };
 }

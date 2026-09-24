@@ -33,3 +33,6 @@ npm-debug.log*
 app_data
 .mcpregistry_registry_token
 .mcpregistry_github_token
+
+# AgentCore 代码包的构建产物（tsup.agentcore.config.ts 的输出）
+dist-agentcore/
