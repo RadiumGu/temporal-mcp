@@ -181,7 +181,10 @@ export const workflowToolDefinitions = [
   },
   {
     name: 'signal_workflow',
-    description: 'Send a signal to a running workflow execution.',
+    description:
+      'Send a signal to a running workflow execution. Fire-and-forget: it is durably recorded even with no Worker ' +
+      'online, but there is NO validator — an invalid or unauthorised signal still lands in the Event History, and ' +
+      'the caller gets no result back. For anything that must be approved or refused, prefer update_workflow.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -190,8 +193,60 @@ export const workflowToolDefinitions = [
         run_id: { type: 'string', description: 'Specific run ID (optional, targets latest if omitted).' },
         signal_name: { type: 'string', description: 'Signal name as registered in the workflow.' },
         input: { description: 'Signal payload. Will be JSON-encoded.' },
+        identity: {
+          type: 'string',
+          description:
+            'Who is sending this. Recorded in history for attribution. ' +
+            'NOTE: caller-asserted, NOT authenticated — it attributes, it does not authorise.',
+        },
+        request_id: {
+          type: 'string',
+          description: 'Idempotency key (UUID). Re-sending the same request_id will not deliver the signal twice.',
+        },
       },
       required: ['workflow_id', 'signal_name'],
+    },
+  },
+  {
+    name: 'update_workflow',
+    description:
+      'Send an Update to a running workflow and WAIT for its outcome. Unlike signal_workflow, an Update runs the ' +
+      "workflow's validator FIRST: a rejected request never enters the Event History, and the caller gets the " +
+      'rejection reason back synchronously. Use this for anything that must be approved, refused, or versioned ' +
+      '(plan revisions, approvals, failover rulings). ' +
+      'IMPORTANT: a rejected Update still returns HTTP 200 — read the `rejected` field, not the HTTP status. ' +
+      'Requires a Worker to be online; signal_workflow does not.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        namespace: { type: 'string', description: 'Namespace containing the workflow.' },
+        workflow_id: { type: 'string', description: 'Target workflow ID.' },
+        run_id: { type: 'string', description: 'Specific run ID (optional, targets latest if omitted).' },
+        update_name: {
+          type: 'string',
+          description: 'Update handler name as registered in the workflow (e.g. "revise_plan").',
+        },
+        input: { description: 'Update argument. Will be JSON-encoded as a single payload.' },
+        identity: {
+          type: 'string',
+          description:
+            'Who is sending this (e.g. "alice@example.com"). Recorded in history for attribution. ' +
+            'NOTE: caller-asserted, NOT authenticated — it attributes, it does not authorise.',
+        },
+        update_id: {
+          type: 'string',
+          description:
+            'Idempotency key. Re-sending the same update_id against the same workflow returns the ORIGINAL ' +
+            "outcome instead of applying the update twice — pass it whenever the caller might retry.",
+        },
+        wait_stage: {
+          type: 'string',
+          description:
+            'How long to wait: COMPLETED (default — returns the handler\'s return value) or ACCEPTED ' +
+            '(returns as soon as the validator accepted, without waiting for the handler to finish).',
+        },
+      },
+      required: ['workflow_id', 'update_name'],
     },
   },
   {
@@ -349,6 +404,21 @@ export const signalWorkflowSchema = z.object({
   run_id: z.string().optional(),
   signal_name: z.string(),
   input: z.unknown().optional(),
+  /** 谁发的。事后归因用 —— 注意是调用方自报，不是认证结果。 */
+  identity: z.string().optional(),
+  /** 幂等键。重发同一个 requestId 不会投递第二次。 */
+  request_id: z.string().optional(),
+});
+
+export const updateWorkflowSchema = z.object({
+  namespace: z.string().optional(),
+  workflow_id: z.string(),
+  run_id: z.string().optional(),
+  update_name: z.string(),
+  input: z.unknown().optional(),
+  identity: z.string().optional(),
+  update_id: z.string().optional(),
+  wait_stage: z.enum(['ACCEPTED', 'COMPLETED']).optional(),
 });
 
 export const queryWorkflowSchema = z.object({
@@ -545,6 +615,53 @@ function encodePayload(value: unknown): { metadata: { encoding: string }; data: 
   };
 }
 
+/**
+ * Decodes whatever the HTTP gateway hands back for a query result or an Update outcome.
+ *
+ * ⚠️ 实测（Server 1.32.0 的 HTTP 网关，本地 dev server）：**响应体里的结果已经
+ * 被解码成普通 JSON 数组**，不是请求侧那种
+ * `{"payloads":[{"metadata":...,"data":"<base64>"}]}`：
+ *
+ *     {"queryResult":[{"state":"draft","current_version":1,...}]}
+ *     {"outcome":{"success":[{"accepted":true,"version":2}]}}
+ *
+ * 也就是**请求与响应的 payload 形状不对称** —— 发的时候要自己 base64，
+ * 收的时候不用。第一版按对称假设写，结果是"报告成功但 result 为 null"，
+ * 而那正是最坏的一类错报：调用方以为拿到了 handler 的返回值。
+ *
+ * 两种形状都接：旧版本/其他网关若返回 payloads 形状，这里同样解得开。
+ */
+function decodeOutcomePayloads(value: unknown): unknown {
+  if (value === null || value === undefined) return null;
+
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    const first = value[0] as Record<string, unknown>;
+    // 数组元素若仍是 payload 形状（带 base64 data），再解一层。
+    if (first && typeof first === 'object' && typeof first.data === 'string' && first.metadata) {
+      return decodeBase64Json(first.data as string);
+    }
+    return first;
+  }
+
+  const obj = value as Record<string, unknown>;
+  const payloads = obj.payloads as Record<string, unknown>[] | undefined;
+  if (payloads?.length && typeof payloads[0].data === 'string') {
+    return decodeBase64Json(payloads[0].data as string);
+  }
+  // handler 返回 None：success 存在但没有内容。这是**接受**，不是拒绝。
+  return null;
+}
+
+function decodeBase64Json(data: string): unknown {
+  const text = Buffer.from(data, 'base64').toString('utf-8');
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
 export async function handleStartWorkflow(
   args: z.infer<typeof startWorkflowSchema>,
   client: TemporalClient
@@ -631,6 +748,8 @@ export async function handleSignalWorkflow(
   const body: Record<string, unknown> = {};
   if (args.run_id) body['workflowExecution'] = { workflowId: args.workflow_id, runId: args.run_id };
   if (args.input !== undefined) body.input = { payloads: [encodePayload(args.input)] };
+  if (args.identity) body.identity = args.identity;
+  if (args.request_id) body.requestId = args.request_id;
 
   await client.post(
     `/api/v1/namespaces/${encodeURIComponent(ns)}/workflows/${encodeURIComponent(args.workflow_id)}/signal/${encodeURIComponent(args.signal_name)}`,
@@ -640,8 +759,108 @@ export async function handleSignalWorkflow(
   return {
     content: [{
       type: 'text',
-      text: `Signal "${args.signal_name}" sent to workflow "${args.workflow_id}" successfully.`,
+      text: [
+        `Signal "${args.signal_name}" sent to workflow "${args.workflow_id}" successfully.`,
+        '',
+        '> ⚠️ A signal has **no validator**: it is now in the Event History whether or not the workflow',
+        '> considers it valid, and this call cannot tell you which. If the workflow exposes an Update',
+        '> handler for the same decision, use `update_workflow` instead — it rejects before writing history',
+        '> and tells you the reason.',
+      ].join('\n'),
     }],
+  };
+}
+
+/**
+ * Sends an Update and reports its OUTCOME, not just its delivery.
+ *
+ * ⚠️ 这个 handler 存在的全部意义在于区分两件 HTTP 层面无法区分的事：
+ *
+ *   · validator **接受**了请求，handler 返回了结果      -> 200 + outcome.success
+ *   · validator **拒绝**了请求，什么都没发生            -> 200 + outcome.failure
+ *
+ * 两者都是 HTTP 200。把后者报成「update 已发送」是最危险的一种误报：
+ * 调用方会以为计划已被修订 / 审批已生效，而实际上 history 里一条都没有。
+ * 所以这里把 `rejected` 作为结构化结果的第一个字段。
+ */
+export async function handleUpdateWorkflow(
+  args: z.infer<typeof updateWorkflowSchema>,
+  client: TemporalClient
+): Promise<ToolResult> {
+  const ns = client.ns(args.namespace);
+
+  // 实测（1.29.7）：只发 {} 时服务端回 400 "Update meta is not set on request."
+  // —— 说明 `request.meta` 是必填，且路由本身存在。
+  const meta: Record<string, unknown> = {};
+  if (args.update_id) meta.updateId = args.update_id;
+  if (args.identity) meta.identity = args.identity;
+
+  const input: Record<string, unknown> = { name: args.update_name };
+  if (args.input !== undefined) input.args = { payloads: [encodePayload(args.input)] };
+
+  const body: Record<string, unknown> = {
+    request: { meta, input },
+    waitPolicy: {
+      lifecycleStage: `UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_${args.wait_stage ?? 'COMPLETED'}`,
+    },
+  };
+  if (args.run_id) {
+    body.workflowExecution = { workflowId: args.workflow_id, runId: args.run_id };
+  }
+
+  const data = await client.post<Record<string, unknown>>(
+    `/api/v1/namespaces/${encodeURIComponent(ns)}/workflows/${encodeURIComponent(args.workflow_id)}/update/${encodeURIComponent(args.update_name)}`,
+    body
+  );
+
+  const outcome = data.outcome as Record<string, unknown> | undefined;
+  const failure = outcome?.failure as Record<string, unknown> | undefined;
+  const success = outcome?.success as Record<string, unknown> | undefined;
+  const updateRef = data.updateRef as Record<string, unknown> | undefined;
+
+  const rejected = failure !== undefined;
+  let resultValue: unknown;
+  if (success !== undefined) {
+    resultValue = decodeOutcomePayloads(success);
+  }
+
+  const lines: string[] = [
+    rejected
+      ? `# ❌ Update "${args.update_name}" was REJECTED — nothing was changed`
+      : `# ✅ Update "${args.update_name}" accepted and applied`,
+    '',
+    `- Workflow: ${args.workflow_id}`,
+    `- Stage reached: ${data.stage ?? 'N/A'}`,
+  ];
+  if (updateRef?.updateId) lines.push(`- Update ID: ${updateRef.updateId}`);
+  if (args.identity) lines.push(`- Claimed identity: ${args.identity} *(caller-asserted, not authenticated)*`);
+
+  if (rejected) {
+    lines.push(
+      '',
+      `**Reason:** ${failure?.message ?? JSON.stringify(failure)}`,
+      '',
+      '> The workflow\'s validator refused this request. Nothing entered the Event History and no state',
+      '> changed — this is the guard working as designed, not a transport error. Fix the request and resend.',
+    );
+  } else {
+    lines.push('', '## Result', '```json', JSON.stringify(resultValue, null, 2), '```');
+  }
+
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      // 第一个字段刻意是 rejected：调用方最容易漏读的就是它。
+      rejected,
+      updateName: args.update_name,
+      workflowId: args.workflow_id,
+      updateId: updateRef?.updateId ?? args.update_id ?? null,
+      stage: data.stage ?? null,
+      result: rejected ? null : resultValue,
+      rejectionReason: rejected ? (failure?.message ?? JSON.stringify(failure)) : null,
+      claimedIdentity: args.identity ?? null,
+      identityIsAuthenticated: false,
+    },
   };
 }
 
@@ -659,21 +878,12 @@ export async function handleQueryWorkflow(
     body
   );
 
-  const result = data.queryResult as Record<string, unknown> | undefined;
-  const payloads = result?.payloads as unknown[] | undefined;
-
-  let resultText = JSON.stringify(data, null, 2);
-  if (payloads?.length) {
-    try {
-      const payload = payloads[0] as Record<string, unknown>;
-      if (payload.data) {
-        const decoded = Buffer.from(payload.data as string, 'base64').toString('utf-8');
-        resultText = decoded;
-      }
-    } catch {
-      // fall back to raw JSON
-    }
-  }
+  // ⚠️ 2026-09-26 实测修正：网关返回的 queryResult 是**已解码的 JSON 数组**，
+  // 不是 base64 payloads。原实现只认 payloads 形状，因此一路落到
+  // `JSON.stringify(data)` 兜底 —— 调用方拿到的是整包协议报文而不是查询结果。
+  const decoded = decodeOutcomePayloads(data.queryResult);
+  const resultText =
+    decoded === null ? JSON.stringify(data, null, 2) : JSON.stringify(decoded, null, 2);
 
   const lines = [
     `# Query Result: ${args.query_type}`,
@@ -684,7 +894,14 @@ export async function handleQueryWorkflow(
     '```',
   ];
 
-  return { content: [{ type: 'text', text: lines.join('\n') }] };
+  return {
+    content: [{ type: 'text', text: lines.join('\n') }],
+    structuredContent: {
+      workflowId: args.workflow_id,
+      queryType: args.query_type,
+      result: decoded,
+    },
+  };
 }
 
 export async function handleCancelWorkflow(

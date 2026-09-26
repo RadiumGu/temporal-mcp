@@ -20,9 +20,11 @@ import {
   listWorkflowsSchema, describeWorkflowSchema, startWorkflowSchema,
   signalWorkflowSchema, queryWorkflowSchema, cancelWorkflowSchema, terminateWorkflowSchema,
   countWorkflowsSchema, pauseWorkflowSchema, unpauseWorkflowSchema, signalWithStartWorkflowSchema,
+  updateWorkflowSchema,
   handleListWorkflows, handleDescribeWorkflow, handleStartWorkflow,
   handleSignalWorkflow, handleQueryWorkflow, handleCancelWorkflow, handleTerminateWorkflow,
   handleCountWorkflows, handlePauseWorkflow, handleUnpauseWorkflow, handleSignalWithStartWorkflow,
+  handleUpdateWorkflow,
 } from './tools/workflows.js';
 import {
   historyToolDefinitions,
@@ -87,6 +89,7 @@ const ESSENTIAL_TOOLS = new Set([
   'describe_workflow',
   'start_workflow',
   'signal_workflow',
+  'update_workflow',
   'query_workflow',
   'cancel_workflow',
   'terminate_workflow',
@@ -119,6 +122,37 @@ function resolveToolTier(): 'essential' | 'standard' | 'all' {
   if (val === 'all') return 'all';
   if (val === 'standard') return 'standard';
   return 'essential';
+}
+
+/**
+ * 按名字禁用工具。`TEMPORAL_DENY_TOOLS=terminate_workflow,cancel_workflow`
+ *
+ * ## 为什么需要它，而 tier 不够
+ *
+ * tier 分的是**数量**（essential / standard / all），分不了**危险程度**：
+ * `terminate_workflow` 在 essential 里，而它能一刀砍掉一个正在进行的
+ * 灾备切换。对一个由 agent 驱动的部署来说，"能做的事"和"该让它做的事"
+ * 不是一回事。
+ *
+ * ## 默认为空是刻意的
+ *
+ * 默认不禁任何工具 —— 否则升级这个版本会静默改变别人已有部署的行为。
+ * 要收紧的部署显式配置它。
+ *
+ * ## ⚠️ 必须在分派处也生效，不能只过滤工具列表
+ *
+ * 只把工具从 `tools/list` 里隐掉是**假闸门**：MCP 客户端可以直接按名字
+ * 调用一个没列出来的工具，分派用的是 `switch (name)`，照样会执行。
+ * 所以这里返回的集合在两处都用：列表过滤 **和** 调用入口。
+ */
+function resolveDeniedTools(): Set<string> {
+  const raw = process.env.TEMPORAL_DENY_TOOLS ?? '';
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+  );
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -185,6 +219,7 @@ export function createConfiguredServer(): {
 
 
   const tier = resolveToolTier();
+  const denied = resolveDeniedTools();
   const allToolDefs = [
     // Phase 1
     ...clusterToolDefinitions,
@@ -202,16 +237,33 @@ export function createConfiguredServer(): {
     ...workflowRuleToolDefinitions,
   ];
 
-  const tools = tier === 'all'
+  const tools = (tier === 'all'
     ? allToolDefs
     : allToolDefs.filter((t) =>
         tier === 'standard' ? STANDARD_TOOLS.has(t.name) : ESSENTIAL_TOOLS.has(t.name)
-      );
+      )
+  ).filter((t) => !denied.has(t.name));
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
+
+    // 闸门在这里，不只在 tools/list 里 —— 见 resolveDeniedTools 的注释：
+    // 只隐藏不拦截等于没拦。
+    if (denied.has(name)) {
+      return {
+        isError: true,
+        content: [{
+          type: 'text' as const,
+          text:
+            `Tool "${name}" is disabled on this server by TEMPORAL_DENY_TOOLS. ` +
+            'This is a deliberate configuration decision by the operator, not a transient error — ' +
+            'do not retry it and do not look for another tool that performs the same mutation. ' +
+            'If this action is genuinely required, ask the operator to change the server configuration.',
+        }],
+      };
+    }
 
     switch (name) {
       // ── Cluster ──────────────────────────────────────────────────────────
@@ -253,6 +305,11 @@ export function createConfiguredServer(): {
         const parsed = parseArgs(signalWorkflowSchema, args);
         if (!parsed.ok) return parsed.error;
         return runTool(() => handleSignalWorkflow(parsed.data, client));
+      }
+      case 'update_workflow': {
+        const parsed = parseArgs(updateWorkflowSchema, args);
+        if (!parsed.ok) return parsed.error;
+        return runTool(() => handleUpdateWorkflow(parsed.data, client));
       }
       case 'query_workflow': {
         const parsed = parseArgs(queryWorkflowSchema, args);
