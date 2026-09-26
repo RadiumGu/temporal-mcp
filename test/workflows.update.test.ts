@@ -46,18 +46,18 @@ describe('update_workflow：拒绝与成功必须分开', () => {
       stage: 'UPDATE_WORKFLOW_EXECUTION_LIFECYCLE_STAGE_COMPLETED',
       updateRef: { updateId: 'u-1' },
       outcome: {
-        failure: { message: '非法裁决 "maybe"。合法值：["abort","allow_data_loss","ordered"]' },
+        failure: { message: 'invalid decision "maybe"; allowed: ["approve","reject"]' },
       },
     });
 
     const res = await handleUpdateWorkflow(
-      { workflow_id: 'dr-1', update_name: 'database_decision', input: 'maybe' } as never,
+      { workflow_id: 'order-42', update_name: 'approve_shipment', input: 'maybe' } as never,
       client
     );
 
     expect(res.structuredContent?.rejected).toBe(true);
     expect(res.structuredContent?.result).toBeNull();
-    expect(String(res.structuredContent?.rejectionReason)).toContain('非法裁决');
+    expect(String(res.structuredContent?.rejectionReason)).toContain('invalid decision');
     // 文本里必须能一眼看出什么都没改 —— 不能读成"已发送"。
     expect(res.content[0].text).toContain('REJECTED');
     expect(res.content[0].text).not.toContain('accepted and applied');
@@ -71,7 +71,7 @@ describe('update_workflow：拒绝与成功必须分开', () => {
     });
 
     const res = await handleUpdateWorkflow(
-      { workflow_id: 'dr-1', update_name: 'revise_plan', input: { body: 'x' } } as never,
+      { workflow_id: 'order-42', update_name: 'revise_plan', input: { body: 'x' } } as never,
       client
     );
 
@@ -89,7 +89,7 @@ describe('update_workflow：拒绝与成功必须分开', () => {
       outcome: { success: [{ accepted: true, version: 2, sha256: 'abc' }] },
     });
     const res = await handleUpdateWorkflow(
-      { workflow_id: 'dr-1', update_name: 'revise_plan' } as never,
+      { workflow_id: 'order-42', update_name: 'revise_plan' } as never,
       client
     );
     expect(res.structuredContent?.rejected).toBe(false);
@@ -115,7 +115,7 @@ describe('update_workflow：拒绝与成功必须分开', () => {
     const { client, calls } = stubClient({ outcome: { success: {} } });
     await handleUpdateWorkflow(
       {
-        workflow_id: 'dr-1',
+        workflow_id: 'order-42',
         update_name: 'approve_plan',
         input: { version: 2 },
         identity: 'alice',
@@ -127,7 +127,7 @@ describe('update_workflow：拒绝与成功必须分开', () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].path).toBe(
-      '/api/v1/namespaces/default/workflows/dr-1/update/approve_plan'
+      '/api/v1/namespaces/default/workflows/order-42/update/approve_plan'
     );
     const req = calls[0].body?.request as Record<string, Record<string, unknown>>;
     expect(req.meta).toEqual({ updateId: 'idem-1', identity: 'alice' });
@@ -164,8 +164,8 @@ describe('signal_workflow：补上 identity，并明说它没有 validator', () 
     const { client, calls } = stubClient({});
     await handleSignalWorkflow(
       {
-        workflow_id: 'dr-1',
-        signal_name: 'database_decision',
+        workflow_id: 'order-42',
+        signal_name: 'approve_shipment',
         input: 'ordered',
         identity: 'alice',
         request_id: 'r-1',

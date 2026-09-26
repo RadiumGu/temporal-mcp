@@ -71,7 +71,7 @@ describe('TEMPORAL_DENY_TOOLS', () => {
 
     const res = await client.callTool({
       name: 'terminate_workflow',
-      arguments: { workflow_id: 'dr-rebuild-1790322231', reason: 'oops' },
+      arguments: { workflow_id: 'order-42', reason: 'oops' },
     });
 
     expect(res.isError).toBe(true);

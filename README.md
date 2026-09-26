@@ -154,26 +154,43 @@ claude mcp add temporal \
 | `TEMPORAL_NAMESPACE` | No | `default` | Default namespace for all tools |
 | `TEMPORAL_API_KEY` | No | — | Bearer token for authenticated clusters |
 | `TEMPORAL_TOOLS` | No | `essential` | Tool set: `essential`, `standard`, or `all` |
+| `TEMPORAL_DENY_TOOLS` | No | — | Comma-separated tool names to disable regardless of tier, e.g. `terminate_workflow,cancel_workflow`. Enforced on **both** `tools/list` and `tools/call`: a denied tool is hidden *and* refused when invoked directly by name. Empty by default, so upgrading never silently changes an existing deployment's behaviour. |
 
 ### Tool tiers
 
 | `TEMPORAL_TOOLS` | # | Role |
 |---|---:|---|
-| `essential` | 11 | **Default.** Cluster + namespaces + everyday workflow run/debug (list, describe, start, signal, query, cancel, terminate, history). Smallest tool list for the LLM. |
-| `standard` | 23 | **essential** plus counts, pause/unpause, signal-with-start, schedules, activities, task queue description, and search attributes. |
-| `all` | 36 | **standard** plus batch operations, worker deployments, Nexus endpoints, and workflow rules. |
+| `essential` | 12 | **Default.** Cluster + namespaces + everyday workflow run/debug (list, describe, start, signal, **update**, query, cancel, terminate, history). Smallest tool list for the LLM. |
+| `standard` | 24 | **essential** plus counts, pause/unpause, signal-with-start, schedules, activities, task queue description, and search attributes. |
+| `all` | 37 | **standard** plus batch operations, worker deployments, Nexus endpoints, and workflow rules. |
 
 | Set | Tools |
 |---|---|
-| `essential` only (11) | `get_cluster_info`, `list_namespaces`, `describe_namespace`, `list_workflows`, `describe_workflow`, `start_workflow`, `signal_workflow`, `query_workflow`, `cancel_workflow`, `terminate_workflow`, `get_workflow_history` |
-| Also enabled with `standard` (+12, 23 total with essential) | `count_workflows`, `pause_workflow`, `unpause_workflow`, `signal_with_start_workflow`, `list_schedules`, `describe_schedule`, `create_schedule`, `delete_schedule`, `list_activities`, `describe_activity`, `describe_task_queue`, `list_search_attributes` |
-| Also enabled with `all` (+13, 36 total with standard) | `list_batch_operations`, `describe_batch_operation`, `stop_batch_operation`, `list_worker_deployments`, `describe_worker_deployment`, `list_nexus_endpoints`, `get_nexus_endpoint`, `create_nexus_endpoint`, `delete_nexus_endpoint`, `list_workflow_rules`, `describe_workflow_rule`, `create_workflow_rule`, `delete_workflow_rule` |
+| `essential` only (12) | `get_cluster_info`, `list_namespaces`, `describe_namespace`, `list_workflows`, `describe_workflow`, `start_workflow`, `signal_workflow`, `update_workflow`, `query_workflow`, `cancel_workflow`, `terminate_workflow`, `get_workflow_history` |
+| Also enabled with `standard` (+12, 24 total with essential) | `count_workflows`, `pause_workflow`, `unpause_workflow`, `signal_with_start_workflow`, `list_schedules`, `describe_schedule`, `create_schedule`, `delete_schedule`, `list_activities`, `describe_activity`, `describe_task_queue`, `list_search_attributes` |
+| Also enabled with `all` (+13, 37 total with standard) | `list_batch_operations`, `describe_batch_operation`, `stop_batch_operation`, `list_worker_deployments`, `describe_worker_deployment`, `list_nexus_endpoints`, `get_nexus_endpoint`, `create_nexus_endpoint`, `delete_nexus_endpoint`, `list_workflow_rules`, `describe_workflow_rule`, `create_workflow_rule`, `delete_workflow_rule` |
 
 ## Structured Output
 
 Key tools return both a human-readable text summary and a machine-readable `structuredContent` JSON object. Clients that support MCP structured output (e.g. Claude) can use the structured data for further processing without parsing text.
 
-Tools with structured output: `get_cluster_info`, `list_namespaces`, `list_workflows`, `describe_workflow`, `count_workflows`, `list_schedules`, `list_activities`.
+Tools with structured output: `get_cluster_info`, `list_namespaces`, `list_workflows`, `describe_workflow`, `update_workflow`, `query_workflow`, `count_workflows`, `list_schedules`, `list_activities`.
+
+### Signal vs Update
+
+Both deliver a message to a running Workflow, but they fail differently — and the difference matters whenever the message represents a decision someone is accountable for.
+
+| | `signal_workflow` | `update_workflow` |
+|---|---|---|
+| Validator runs first | No | **Yes** |
+| An invalid message | still lands in Event History | **never enters history** |
+| Caller learns the outcome | No | **Yes, synchronously** |
+| Needs a Worker online | No | Yes |
+| Returns the handler's value | No | Yes |
+
+**A rejected Update is still HTTP 200.** The rejection arrives as `outcome.failure` inside a successful response, so read the `rejected` field in `structuredContent` — never the HTTP status. Reporting a rejected Update as "sent" is the worst failure mode here: the caller believes the state changed while nothing was written.
+
+`identity` on both tools is **caller-asserted, not authenticated**. It attributes an action; it does not authorise one. `structuredContent.identityIsAuthenticated` is therefore always `false` — do not build an access-control decision on it.
 
 ## Local Development
 
